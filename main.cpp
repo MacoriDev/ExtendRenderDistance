@@ -22,7 +22,7 @@ static constexpr uint32_t MAX_RENDER_DISTANCE_CHUNKS = 96;
 // =========================
 static constexpr uint32_t MIN_RENDER_DISTANCE_CHUNKS = 5;
 
-static constexpr uintptr_t OREUI_GFX_VIEWDISTANCE_LR_RVA = 0x0b1a052c;
+static constexpr uintptr_t OREUI_GFX_VIEWDISTANCE_LR_RVA = 0x0b1a0d7c;
 
 struct MapRegion {
     uintptr_t start;
