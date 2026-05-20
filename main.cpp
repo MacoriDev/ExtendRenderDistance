@@ -15,14 +15,14 @@
 // =========================
 // User config
 // =========================
+// OreUI render distance slider will become:
+// 5, 6, 7, ... MAX_RENDER_DISTANCE_CHUNKS
 static constexpr uint32_t MAX_RENDER_DISTANCE_CHUNKS = 96;
 
 // =========================
-// Don't Use
+// Don't use
 // =========================
-static constexpr uint32_t MIN_RENDER_DISTANCE_CHUNKS = 5;
-
-static constexpr uintptr_t OREUI_GFX_VIEWDISTANCE_LR_RVA = 0x0b1a0d7c;
+static constexpr uint32_t ORIGINAL_MIN_RENDER_DISTANCE_CHUNKS = 5;
 
 struct MapRegion {
     uintptr_t start;
@@ -65,6 +65,7 @@ static GHook g_target_hook = nullptr;
 
 static uintptr_t g_lib_base = 0;
 static uintptr_t g_call_target = 0;
+static uintptr_t g_expected_lr = 0;
 
 static uintptr_t untag(uintptr_t p) {
     return p & 0x00FFFFFFFFFFFFFFull;
@@ -100,7 +101,6 @@ static std::vector<MapRegion> read_maps() {
         }
 
         std::string name;
-
         size_t slash = line.find('/');
         size_t bracket = line.find('[');
 
@@ -142,18 +142,15 @@ static void refresh_mem_ranges() {
             continue;
         }
 
-        bool readable = perms[0] == 'r';
-        bool writable = perms[1] == 'w';
-
-        if (!readable) {
+        if (perms[0] != 'r') {
             continue;
         }
 
         g_mem_ranges[g_mem_range_count++] = {
             start,
             end,
-            readable,
-            writable
+            perms[0] == 'r',
+            perms[1] == 'w'
         };
     }
 }
@@ -173,11 +170,7 @@ static bool is_readable_cached(uintptr_t ptr, size_t size) {
     for (int i = 0; i < g_mem_range_count; i++) {
         const auto& r = g_mem_ranges[i];
 
-        if (!r.readable) {
-            continue;
-        }
-
-        if (p >= r.start && e <= r.end) {
+        if (r.readable && p >= r.start && e <= r.end) {
             return true;
         }
     }
@@ -200,11 +193,7 @@ static bool is_writable_cached(uintptr_t ptr, size_t size) {
     for (int i = 0; i < g_mem_range_count; i++) {
         const auto& r = g_mem_ranges[i];
 
-        if (!r.readable || !r.writable) {
-            continue;
-        }
-
-        if (p >= r.start && e <= r.end) {
+        if (r.readable && r.writable && p >= r.start && e <= r.end) {
             return true;
         }
     }
@@ -255,7 +244,6 @@ static bool safe_write_u64(uintptr_t addr, uint64_t value) {
 
 static bool find_libminecraftpe(LibInfo& out) {
     auto maps = read_maps();
-
     uintptr_t min_addr = UINTPTR_MAX;
 
     for (const auto& r : maps) {
@@ -302,6 +290,7 @@ static uintptr_t decode_bl_target(uintptr_t pc, uint32_t word) {
 
 static bool scan_oreui_viewdistance_callsite(const LibInfo& lib) {
     // OreUI gfx_viewdistance callsite pattern.
+    // This pattern survived 26.20 -> 26.21 and should tolerate minor RVA shifts.
     static constexpr uint32_t P0 = 0xAA1A03E0u; // mov x0, x26
     static constexpr uint32_t P1 = 0x52800501u; // mov w1, #0x28
     static constexpr uint32_t P2 = 0x52800022u; // mov w2, #0x1
@@ -334,7 +323,10 @@ static bool scan_oreui_viewdistance_callsite(const LibInfo& lib) {
             }
 
             uintptr_t callsite = p + 0x1c;
+
             g_call_target = decode_bl_target(callsite, call);
+            g_expected_lr = callsite + 4;
+
             return true;
         }
     }
@@ -394,7 +386,7 @@ static bool read_vector_from_x7(uintptr_t x7, VecInfo* out) {
             return false;
         }
 
-        uint32_t expected = MIN_RENDER_DISTANCE_CHUNKS + static_cast<uint32_t>(i);
+        uint32_t expected = ORIGINAL_MIN_RENDER_DISTANCE_CHUNKS + static_cast<uint32_t>(i);
 
         if (v != expected) {
             return false;
@@ -405,18 +397,18 @@ static bool read_vector_from_x7(uintptr_t x7, VecInfo* out) {
     out->begin = begin;
     out->end = end;
     out->cap = cap;
-    out->max_value = MIN_RENDER_DISTANCE_CHUNKS + static_cast<uint32_t>(count) - 1;
+    out->max_value = ORIGINAL_MIN_RENDER_DISTANCE_CHUNKS + static_cast<uint32_t>(count) - 1;
     out->count = count;
 
     return true;
 }
 
 static uintptr_t create_chunk_list(uintptr_t old_begin, uint32_t target_max, size_t* out_count) {
-    if (target_max < MIN_RENDER_DISTANCE_CHUNKS) {
+    if (target_max < ORIGINAL_MIN_RENDER_DISTANCE_CHUNKS) {
         return 0;
     }
 
-    size_t count = static_cast<size_t>(target_max - MIN_RENDER_DISTANCE_CHUNKS + 1);
+    size_t count = static_cast<size_t>(target_max - ORIGINAL_MIN_RENDER_DISTANCE_CHUNKS + 1);
     size_t bytes = count * sizeof(uint32_t);
 
     auto* values = static_cast<uint32_t*>(::operator new(bytes, std::nothrow));
@@ -426,15 +418,14 @@ static uintptr_t create_chunk_list(uintptr_t old_begin, uint32_t target_max, siz
     }
 
     for (size_t i = 0; i < count; i++) {
-        values[i] = MIN_RENDER_DISTANCE_CHUNKS + static_cast<uint32_t>(i);
+        values[i] = ORIGINAL_MIN_RENDER_DISTANCE_CHUNKS + static_cast<uint32_t>(i);
     }
 
     if (out_count) {
         *out_count = count;
     }
 
-    uintptr_t raw = reinterpret_cast<uintptr_t>(values);
-    return preserve_pointer_style(old_begin, raw);
+    return preserve_pointer_style(old_begin, reinterpret_cast<uintptr_t>(values));
 }
 
 static bool patch_x7_vector(uintptr_t x7) {
@@ -444,7 +435,7 @@ static bool patch_x7_vector(uintptr_t x7) {
         return false;
     }
 
-    size_t target_count = MAX_RENDER_DISTANCE_CHUNKS - MIN_RENDER_DISTANCE_CHUNKS + 1;
+    size_t target_count = MAX_RENDER_DISTANCE_CHUNKS - ORIGINAL_MIN_RENDER_DISTANCE_CHUNKS + 1;
 
     if (vec.max_value >= MAX_RENDER_DISTANCE_CHUNKS && vec.count >= target_count) {
         return false;
@@ -476,10 +467,17 @@ static bool patch_x7_vector(uintptr_t x7) {
 }
 
 extern "C" void hook_patch_context(void* saved_sp, void* original_lr) {
-    auto* regs = reinterpret_cast<uintptr_t*>(saved_sp);
+    if (!g_expected_lr) {
+        return;
+    }
 
     uintptr_t lr = reinterpret_cast<uintptr_t>(original_lr);
-    uintptr_t lr_rva = g_lib_base ? (lr - g_lib_base) : 0;
+
+    if (lr != g_expected_lr) {
+        return;
+    }
+
+    auto* regs = reinterpret_cast<uintptr_t*>(saved_sp);
 
     uintptr_t x1 = regs[1];
     uintptr_t x2 = regs[2];
@@ -487,7 +485,6 @@ extern "C" void hook_patch_context(void* saved_sp, void* original_lr) {
     uintptr_t x7 = regs[7];
 
     bool is_oreui_viewdistance =
-        lr_rva == OREUI_GFX_VIEWDISTANCE_LR_RVA &&
         x1 == 0x28 &&
         x2 == 0x1 &&
         x3 == 0x10;
